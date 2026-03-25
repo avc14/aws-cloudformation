@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Priority Queues with Lambda Consumer
+
+Resources:
+  #SNS Topic
+  devopsPriorityQueuesTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: devops-Priority-Queues-Topic
+
+  #high priority queue
+  devopsHighPriorityQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: devops-High-Priority-Queue
+
+  #low priority queue
+  devopsLowPriorityQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: devops-Low-Priority-Queue
+
+  # Allow SNS to publish to high queue
+  HighPriorityQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref devopsHighPriorityQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt devopsHighPriorityQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref devopsPriorityQueuesTopic
+
+  # Allow SNS to publish to low queue
+  LowPriorityQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref devopsLowPriorityQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: sqs:SendMessage
+            Resource: !GetAtt devopsLowPriorityQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref devopsPriorityQueuesTopic
+
+  # SNS subscriptions
+  HighPrioritySubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref devopsPriorityQueuesTopic
+      Protocol: sqs
+      Endpoint: !GetAtt devopsHighPriorityQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicy: 
+        priority:
+	  - high
+
+  LowPrioritySubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref devopsPriorityQueuesTopic
+      Protocol: sqs
+      Endpoint: !GetAtt devopsLowPriorityQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicy:
+        priority:
+          - low
+  # IAM role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda_execution_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+  # Lambda Function
+  devopsPrioritiesQueueFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: devops-priorities-queue-function
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          high_priority_queue: !Ref devopsHighPriorityQueue
+          low_priority_queue: !Ref devopsLowPriorityQueue
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          sqs = boto3.client('sqs')
+
+          def delete_message(queue_url, receipt_handle, message):
+              sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+              return "Message '" + message + "' deleted"
+              
+          def poll_messages(queue_url):
+              response = sqs.receive_message(
+                  QueueUrl=queue_url,
+                  MaxNumberOfMessages=1,
+                  MessageAttributeNames=['All'],
+                  WaitTimeSeconds=0
+              )
+              if "Messages" in response:
+                  receipt_handle = response['Messages'][0]['ReceiptHandle']
+                  message = response['Messages'][0]['Body']
+                  return delete_message(queue_url, receipt_handle, message)
+              else:
+                  return "No more messages to poll"
+
+          def lambda_handler(event, context):
+              response = poll_messages(os.environ['high_priority_queue'])
+              if response == "No more messages to poll":
+                  response = poll_messages(os.environ['low_priority_queue'])
+              return response
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref devopsPriorityQueuesTopic
+
